@@ -1,4 +1,5 @@
 Customer Query Testing Scenarios
+
 Scenario 1: Product Information Query
 Input:
 What are the key features of your Cloud Manager Pro service?

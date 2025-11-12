@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+import httpx
 from chromadb.api import Collection
 
 # Configure logging
@@ -17,34 +17,45 @@ logger = logging.getLogger(__name__)
 # LLM utilities
 class LLMUtils:
     def __init__(self, base_url: str, model_name: str):
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         logger.info(f"Initialized LLM interface with model: {model_name}")
 
-    def generate_response(
+    async def generate_response(
         self, prompt: str, system_prompt: Optional[str] = None
     ) -> str:
-        """Generate a response from the LLM using Ollama API"""
+        """Generate a response from the LLM using Ollama API (async via httpx)"""
+        url = f"{self.base_url}/api/generate"
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": False
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
         try:
-            url = f"{self.base_url}/api/generate"
-            payload = {"model": self.model_name, "prompt": prompt, "stream": False}
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
 
-            if system_prompt:
-                payload["system"] = system_prompt
+                data = response.json()
+                text = data.get("response", "")
+                logger.info(f"LLM response received successfully (len={len(text)})")
+                return text
 
-            response = requests.post(url, json=payload)
-            logger.info(f"LLM response: {response}")
-            print(response.text)
-            logger.info("********************************************")
-
-            # Extract and return the generated text
-            return response.json().get("response", "")
+        except httpx.TimeoutException:
+            logger.error("Timeout while waiting for LLM response.")
+            return "The request to the language model timed out. Please try again."
+        except httpx.RequestError as e:
+            logger.error(f"Network error while calling LLM API: {e}")
+            return f"Network error communicating with LLM API: {str(e)}"
+        except ValueError as e:
+            logger.error(f"Invalid JSON response from LLM API: {e}")
+            return "Received an invalid response from the language model."
         except Exception as e:
-            logger.error(f"Error generating LLM response: {e}")
-            return (
-                f"I encountered an error while processing your request. Error: {str(e)}"
-            )
-
+            logger.error(f"Unexpected error generating LLM response: {e}")
+            return f"I encountered an error while processing your request. Error: {str(e)}"
 
 # Base Agent class
 class BaseAgent:
@@ -143,9 +154,9 @@ class RouterAgent(BaseAgent):
     #             "clarification_question": "Could you please provide more details about your question?",
     #         }
 
-    def process(self, query: str, conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def process(self, query: str, conversation_history: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         prompt = f"CLASSIFY QUERY: {query}\n\nOUTPUT JSON:"
-        response = self.llm_utils.generate_response(prompt, self.system_prompt)
+        response = await self.llm_utils.generate_response(prompt, self.system_prompt)
         logger.info(f"Router Agent response: {response}")
         logger.info("********************************************")
         
@@ -241,7 +252,7 @@ class ProductSpecialistAgent(BaseAgent):
             logger.error(f"Error retrieving information from vector database: {e}")
             return ""
 
-    def process(
+    async def process(
         self, query: str, conversation_history: List[Dict[str, Any]] = None
     ) -> str:
         # Retrieve relevant information from the knowledge base
@@ -261,7 +272,7 @@ class ProductSpecialistAgent(BaseAgent):
         """
 
         # Generate response
-        response = self.llm_utils.generate_response(prompt, self.system_prompt)
+        response = await self.llm_utils.generate_response(prompt, self.system_prompt)
         return response
 
 
@@ -302,23 +313,35 @@ class TechnicalSupportAgent(BaseAgent):
 
 
     async def _call_diagnostic_api(self, issue_description: str) -> Dict[str, Any]:
-        """Call the diagnostic API for automated issue identification asynchronously"""
+        """Call the diagnostic API for automated issue identification asynchronously."""
+        url = "http://localhost:8000/api/diagnose"
+        payload = {"description": issue_description}
+
         try:
-            # Run the blocking requests.post in a thread so it doesn't block the event loop
-            response = await asyncio.to_thread(
-                requests.post,
-                "http://localhost:8000/api/diagnose",
-                json={"description": issue_description},
-            )
-            response.raise_for_status()
-            logger.info(f"Diagnostic API response: {response}")
-            logger.info("********************************************")
-            result = response.json()
-            logger.info(f"Diagnostic API returned JSON: {result}")
-            return result
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+
+                data = response.json()
+                logger.info(f"Diagnostic API response JSON: {data}")
+                logger.info("********************************************")
+                return data
+
+        except httpx.TimeoutException:
+            logger.error("Timeout while waiting for diagnostic API response.")
+            return {"error": "timeout", "message": "Diagnostic service timed out."}
+
+        except httpx.RequestError as e:
+            logger.error(f"Network error calling diagnostic API: {e}")
+            return {"error": "network", "message": str(e)}
+
+        except ValueError as e:
+            logger.error(f"Invalid JSON from diagnostic API: {e}")
+            return {"error": "invalid_json", "message": str(e)}
+
         except Exception as e:
-            logger.error(f"Error calling diagnostic API: {e}")
-            return {}
+            logger.error(f"Unexpected error calling diagnostic API: {e}")
+            return {"error": "unknown", "message": str(e)}
 
     async def process(
         self, query: str, conversation_history: List[Dict[str, Any]] = None
@@ -357,7 +380,7 @@ class TechnicalSupportAgent(BaseAgent):
         """
 
         # Generate response using the LLM (this call remains synchronous)
-        response = self.llm_utils.generate_response(prompt, self.system_prompt)
+        response = await self.llm_utils.generate_response(prompt, self.system_prompt)
         return response
 
 
@@ -372,54 +395,76 @@ class OrderBillingAgent(BaseAgent):
         You're an expert in handling inquiries about orders, invoices, payments, and subscriptions.
         
         When responding to customer queries:
-        1. Be precise about order status, payment information, and subscription details
-        2. Explain billing charges clearly and transparently
-        3. Outline available payment options and subscription changes when relevant
-        4. Maintain a professional and reassuring tone
+        1. Be precise about order status, payment information, and subscription details.
+        2. Explain billing charges clearly and transparently.
+        3. Outline available payment options and subscription changes when relevant.
+        4. Maintain a professional and reassuring tone.
         
         Keep your responses clear, specific, and focused on addressing the customer's billing-related questions.
         """
 
     async def _get_order_details(self, order_id: str) -> Dict[str, Any]:
-        """Retrieve order details from the Order API"""
+        """Retrieve order details from the Order API (async with httpx)."""
+        url = f"http://localhost:8000/api/orders/{order_id}"
         try:
-            response = await asyncio.to_thread(
-            requests.get, f"http://localhost:8000/api/orders/{order_id}"
-        )
-            response.raise_for_status()
-            logger.info(f"Order details from the order API: {response}")
-            logger.info("********************************************")
-            return response.json()
-        except requests.exceptions.HTTPError as e:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+
+                data = response.json()
+                logger.info(f"Order details from API: {data}")
+                logger.info("********************************************")
+                return data
+
+        except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 logger.warning(f"Order not found: {order_id}")
                 return {}
-            else:
-                logger.error(f"Error retrieving order details: {e}")
-                return {}
+            logger.error(f"HTTP error retrieving order details: {e}")
+            return {}
+
+        except httpx.TimeoutException:
+            logger.error(f"Timeout retrieving order details for: {order_id}")
+            return {}
+
+        except httpx.RequestError as e:
+            logger.error(f"Network error retrieving order details: {e}")
+            return {}
+
         except Exception as e:
-            logger.error(f"Error retrieving order details: {e}")
+            logger.error(f"Unexpected error retrieving order details: {e}")
             return {}
 
     async def _get_account_details(self, account_id: str) -> Dict[str, Any]:
-        """Retrieve account details from the Account API"""
+        """Retrieve account details from the Account API (async with httpx)."""
+        url = f"http://localhost:8000/api/accounts/{account_id}"
         try:
-            response = await asyncio.to_thread(
-            requests.get, f"http://localhost:8000/api/accounts/{account_id}"
-        )
-            logger.info(f"Account details from the account API: {response}")
-            logger.info("********************************************")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+
+                data = response.json()
+                logger.info(f"Account details from API: {data}")
+                logger.info("********************************************")
+                return data
+
+        except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 logger.warning(f"Account not found: {account_id}")
                 return {}
-            else:
-                logger.error(f"Error retrieving account details: {e}")
-                return {}
+            logger.error(f"HTTP error retrieving account details: {e}")
+            return {}
+
+        except httpx.TimeoutException:
+            logger.error(f"Timeout retrieving account details for: {account_id}")
+            return {}
+
+        except httpx.RequestError as e:
+            logger.error(f"Network error retrieving account details: {e}")
+            return {}
+
         except Exception as e:
-            logger.error(f"Error retrieving account details: {e}")
+            logger.error(f"Unexpected error retrieving account details: {e}")
             return {}
 
     async def process(
@@ -486,7 +531,7 @@ class OrderBillingAgent(BaseAgent):
         prompt += "Please provide a helpful response to this billing or order question."
 
         # Generate response
-        response = self.llm_utils.generate_response(prompt, self.system_prompt)
+        response = await self.llm_utils.generate_response(prompt, self.system_prompt)
         logger.info(f"Billing Agent response: {response}")
         logger.info("********************************************")
         return response
@@ -507,27 +552,42 @@ class AccountManagementAgent(BaseAgent):
         
         Keep your responses clear, structured, and detailed.
         """
-    
+
     async def _get_account_info(self, account_id: str) -> Dict[str, Any]:
-        """Retrieve account details using the Account API."""
+        """Retrieve account details using the Account API (async via httpx)."""
+        url = f"http://localhost:8000/api/accounts/{account_id}"
+
         try:
-            url = f"http://localhost:8000/api/accounts/{account_id}"
-            response = await asyncio.to_thread(requests.get, url)
-            response.raise_for_status()
-            logger.info(f"Account API response: {response}")
-            logger.info(f"Account API response status: {response.status_code}")
-            logger.info(f"Raw account API response text: {response.text}")
-            logger.info("********************************************")
-            return response.json()
-        except requests.exceptions.HTTPError as e:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+
+                data = response.json()
+                logger.info(f"Account API response (status {response.status_code}): {data}")
+                logger.info("********************************************")
+                return data
+
+        except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 logger.warning(f"Account not found: {account_id}")
                 return {}
-            else:
-                logger.error(f"Error retrieving account details: {e}")
-                return {}
+            logger.error(f"HTTP error retrieving account details: {e}")
+            return {}
+
+        except httpx.TimeoutException:
+            logger.error(f"Timeout retrieving account info for: {account_id}")
+            return {}
+
+        except httpx.RequestError as e:
+            logger.error(f"Network error while calling Account API: {e}")
+            return {}
+
+        except ValueError as e:
+            logger.error(f"Invalid JSON in Account API response: {e}")
+            return {}
+
         except Exception as e:
-            logger.error(f"Error retrieving account details: {e}")
+            logger.error(f"Unexpected error retrieving account info: {e}")
             return {}
     
     async def process(
@@ -637,7 +697,7 @@ class AgentOrchestrator:
         conversation_history = self.conversations.get(conversation_id, [])
 
         # Route the query using the router agent
-        routing_result = self.router_agent.process(query, conversation_history)
+        routing_result = await self.router_agent.process(query, conversation_history)
 
         # Handle multi-part queries
         if routing_result.get("multi_part", False):
@@ -707,7 +767,7 @@ class AgentOrchestrator:
                 return await self.account_agent.process(query, conversation_history)
             else:
                 # Fallback to billing agent if account agent not yet implemented
-                fallback_response = self.billing_agent.process(
+                fallback_response = await self.billing_agent.process(
                     query, conversation_history
                 )
                 return fallback_response
@@ -723,7 +783,7 @@ class AgentOrchestrator:
             Provide helpful, friendly, and concise responses to general customer inquiries.
             If the query should be handled by a specialist agent, indicate which type of specialist would be appropriate.
             """
-            return self.llm_utils.generate_response(
+            return await self.llm_utils.generate_response(
                 general_prompt, general_system_prompt
             )
 
